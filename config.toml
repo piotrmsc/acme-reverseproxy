@@ -1,0 +1,6 @@
+[CA]
+  CacheDir = "/tmp/acme-reverseproxy"
+  Email = "admin@example.com"
+
+[Mapping]
+  "acmeproxy.kyma-goat.ga" = "http://localhost:9096"

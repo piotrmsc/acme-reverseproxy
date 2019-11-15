@@ -1,10 +1,13 @@
 package main
 
 import (
-	"io/ioutil"
+	"fmt"
+	"github.com/vbatts/acme-reverseproxy/proxymap"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
+	"net/http"
 	"os"
-	"path/filepath"
-	"sort"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/sirupsen/logrus"
@@ -15,67 +18,56 @@ import (
 var cfg config.Config
 
 func main() {
-	app := cli.NewApp()
-	app.Name = "acme-reverseproxy"
-	app.Usage = "A TLS-serving reverse-proxy, with the certificates generated from LetsEncrypt"
-	app.Authors = []cli.Author{
-		{Name: "Vincent Batts", Email: "vbatts@hashbangbash.com"},
-	}
-	app.Flags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "debug,D",
-			Usage: "debug output",
-		},
-	}
-	app.Commands = []cli.Command{
-		{
-			Name:        "gen",
-			Description: "generators of sorts",
-			Subcommands: []cli.Command{
-				{
-					Name:        "config",
-					Description: "generate a sample mapping configuration",
-					Action:      genConfigAction,
-				},
-			},
-		},
-		{
-			Name:        "srv",
-			Description: "Start the reverseproxy server",
-			Action:      srvCommand,
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "config",
-					Value: filepath.Join(os.Getenv("HOME"), ".acme-reverseproxy.toml"),
-					Usage: "Configuration of mapping of hostname -> listener",
-				},
-			},
-			Before: beforeAction,
-		},
-	}
-
-	sort.Sort(cli.FlagsByName(app.Flags))
-	sort.Sort(cli.CommandsByName(app.Commands))
-
-	app.Run(os.Args)
+	genConfigAction()
+	srvCommand()
 }
 
-func beforeAction(c *cli.Context) error {
-	if c.GlobalBool("debug") {
-		logrus.SetLevel(logrus.DebugLevel)
+func genConfigAction() error {
+	tmpConfig := config.Config{
+		CA: config.CA{
+			Email:    "admin@kyma-project.io",
+			CacheDir: "/tmp/acme-reverseproxy",
+		},
+		Mapping: map[string]string{
+			"acmeproxy.kyma-goat.ga": "http://localhost:9096",
+		},
 	}
-	// find and read in the toml config file for hostname -> listener mappingj
-	buf, err := ioutil.ReadFile(c.String("config"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			logrus.Errorf("No config file found at %q. Try 'gen config'", c.String("config"))
-		}
-		return err
-	}
-	tmpConfig := config.Config{}
-	if err := toml.Unmarshal(buf, &tmpConfig); err != nil {
+	e := toml.NewEncoder(os.Stdout)
+	if err := e.Encode(tmpConfig); err != nil {
 		return err
 	}
 	cfg = tmpConfig
 	return nil
+}
+
+func srvCommand() error {
+	var stagingDirectory = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	list := []string{}
+	for key := range cfg.Mapping {
+		if key != "" {
+			list = append(list, key)
+		}
+	}
+	fmt.Println(list)
+	rpm, err := proxymap.ToReverseProxyMap(cfg.Mapping)
+	if err != nil {
+		return cli.NewExitError(err, 2)
+	}
+	rph := proxymap.NewReverseProxiesHandler(rpm)
+	logrus.Debugf("srv: whitelisting %q", strings.Join(list, ","))
+	m := autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(strings.Join(list, ",")),
+		Client:     &acme.Client{DirectoryURL: stagingDirectory},
+	}
+	if cfg.CA.Email != "" {
+		m.Email = cfg.CA.Email
+	}
+	if cfg.CA.CacheDir != "" {
+		m.Cache = autocert.DirCache(cfg.CA.CacheDir)
+	}
+	//setNewACMEClient(&m)
+
+	listener := m.Listener()
+	return http.Serve(listener, rph)
 }
